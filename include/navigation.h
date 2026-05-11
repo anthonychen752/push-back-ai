@@ -9,6 +9,12 @@
 #ifndef NAVIGATION_H
 #define NAVIGATION_H
 
+#include <cmath>
+#include <cstdint>
+#include <vector>
+#include <algorithm>
+#include "ai_jetson.h"
+
 // ═══════════════════════════════════════════════════════════════════════════
 // CONFIG — update these for your robot
 // ═══════════════════════════════════════════════════════════════════════════
@@ -379,150 +385,60 @@ private:
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SERIAL COMMS — Jetson Nano ↔ V5
-// Based on VEX ai_jetson.cpp protocol
-// Uses /dev/serial1 (USB serial from Jetson)
+// Use VEX's built-in ai::jetson class (vex_aivision.h)
+// Handles full protocol: sync bytes AA 55 CC 33, CRC32, threaded receive
+// The Jetson sends detection data; V5 requests it with request_map()
 // ═══════════════════════════════════════════════════════════════════════════
-
-// AI_RECORD structure from VEX (approximate)
-struct AI_RECORD
-{
-    uint8_t sync[4];
-    uint32_t frame_id;
-    float ts;
-    float center_x;
-    float center_y;
-    float center_z;
-    uint16_t class_id;
-    float prob;
-    uint32_t crc32;
-} __attribute__((packed));
 
 class JetsonComms
 {
 public:
-    // Call init() once at startup
+    JetsonComms() : _detectionCount(0), _connected(false) {}
+
     bool init()
     {
-        _fp = fopen("/dev/serial1", "r");
-        if (!_fp)
-            return false;
-        setvbuf(_fp, NULL, _IONBF, 0);
+        _connected = true;
         return true;
     }
 
-    // Call this every loop to read latest detection
-    // Returns number of valid detections available
     int update()
     {
-        int count = 0;
-        uint8_t byte;
-        while (fread(&byte, 1, 1, _fp) == 1)
+        if (!_connected)
         {
-            if (parseByte(byte))
-                count++;
+            return 0;
         }
-        return count;
+
+        int32_t result = _jetson.get_data(&_latest);
+        if (result <= 0)
+        {
+            _detectionCount = 0;
+            return 0;
+        }
+
+        _detectionCount = _latest.detectionCount;
+        return _detectionCount;
     }
 
-    // Get latest detection (index 0 = most recent)
     bool getDetection(int index, AI_RECORD &out)
     {
-        if (index < 0 || static_cast<size_t>(index) >= _detections.size())
+        if (index < 0 || index >= _latest.detectionCount)
+        {
             return false;
-        out = _detections[index];
+        }
+        out = _latest;
         return true;
     }
 
-    // Get number of detections from last update
-    int detectionCount() const { return (int)_detections.size(); }
-
-    bool isConnected() const { return _fp != NULL; }
-
-    void close()
-    {
-        if (_fp)
-        {
-            fclose(_fp);
-            _fp = NULL;
-        }
-    }
+    int detectionCount() const { return _detectionCount; }
+    bool isConnected() const { return _connected; }
+    void close() {}
 
 private:
-    FILE *_fp;
-    std::vector<AI_RECORD> _detections;
-    AI_RECORD _rxBuf;
-    int _rxIdx = 0;
-    uint32_t _crcAcc = 0;
-    bool _inFrame = false;
-
-    static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len);
-
-    bool parseByte(uint8_t byte)
-    {
-        if (!_inFrame)
-        {
-            // Wait for sync
-            _rxBuf.sync[_rxIdx++] = byte;
-            if (_rxIdx == 4)
-            {
-                if (_rxBuf.sync[0] == 0xAA && _rxBuf.sync[1] == 0xAA &&
-                    _rxBuf.sync[2] == 0xAA && _rxBuf.sync[3] == 0xAA)
-                {
-                    _rxIdx = 0;
-                    _crcAcc = 0;
-                    _inFrame = true;
-                }
-                else
-                {
-                    // Shift and keep looking
-                    _rxBuf.sync[0] = _rxBuf.sync[1];
-                    _rxBuf.sync[1] = _rxBuf.sync[2];
-                    _rxBuf.sync[2] = _rxBuf.sync[3];
-                    _rxBuf.sync[3] = byte;
-                    _rxIdx = 4;
-                }
-            }
-        }
-        else
-        {
-            // Receiving frame data
-            reinterpret_cast<uint8_t *>(&_rxBuf)[_rxIdx++] = byte;
-            if (static_cast<size_t>(_rxIdx) >= sizeof(AI_RECORD))
-            {
-                // CRC check
-                uint32_t crcCalc = crc32_update(0, reinterpret_cast<const uint8_t *>(&_rxBuf), sizeof(AI_RECORD) - 4);
-                if (crcCalc == _rxBuf.crc32)
-                {
-                    _detections.clear();
-                    _detections.push_back(_rxBuf);
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
+    ai::jetson _jetson;
+    AI_RECORD _latest;
+    int _detectionCount;
+    bool _connected;
 };
-
-inline uint32_t JetsonComms::crc32_update(uint32_t crc, const uint8_t *data, size_t len)
-{
-    crc = ~crc;
-    for (size_t i = 0; i < len; ++i)
-    {
-        crc ^= data[i];
-        for (int bit = 0; bit < 8; ++bit)
-        {
-            if (crc & 1)
-            {
-                crc = (crc >> 1) ^ 0xEDB88320u;
-            }
-            else
-            {
-                crc >>= 1;
-            }
-        }
-    }
-    return ~crc;
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // STATE MACHINE — SEARCH → COLLECT → SCORE
@@ -547,15 +463,20 @@ public:
     JetsonComms jetson;
 
     // Waypoints (field coords — verify with game manual)
-    Waypoint COLLECT_ZONES[3] = {
-        Waypoint(30, 30),
-        Waypoint(60, 0),
-        Waypoint(30, -30)};
-    Waypoint SCORE_LEFT = Waypoint(-50, 60, true);
-    Waypoint SCORE_RIGHT = Waypoint(-50, -60, true);
-    Waypoint PARK_POS = Waypoint(0, 0);
+    Waypoint COLLECT_ZONES[3];
+    Waypoint SCORE_LEFT;
+    Waypoint SCORE_RIGHT;
+    Waypoint PARK_POS;
 
-    StateMachine() : odom(), pp(odom) {}
+    StateMachine() : odom(), pp(odom)
+    {
+        COLLECT_ZONES[0] = Waypoint(30, 30);
+        COLLECT_ZONES[1] = Waypoint(60, 0);
+        COLLECT_ZONES[2] = Waypoint(30, -30);
+        SCORE_LEFT = Waypoint(-50, 60, true);
+        SCORE_RIGHT = Waypoint(-50, -60, true);
+        PARK_POS = Waypoint(0, 0);
+    }
 
     void reset()
     {

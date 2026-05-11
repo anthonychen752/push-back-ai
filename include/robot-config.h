@@ -9,8 +9,12 @@
 #define ROBOT_CONFIG_H
 
 #include "vex.h"
+#include "ai_jetson.h"
 
 using namespace vex;
+
+// VEX AI Jetson communication (uses VEX's built-in ai::jetson class)
+extern ai::jetson jetson_comms;
 
 extern brain Brain;
 extern competition Competition;

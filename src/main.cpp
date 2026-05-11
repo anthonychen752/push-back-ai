@@ -10,7 +10,9 @@
 #include "navigation.h"
 #include <cmath>
 
-using namespace vex;
+namespace bex = vex;
+using namespace bex;
+brain::lcd &BrainScreen = Brain.Screen;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // VEXCODE DEVICE CONFIG — mirrors robot-config.cpp for reference
@@ -42,7 +44,7 @@ void calibrate()
     {
         wait(20, msec);
     }
-    g_state.odom.reset(0, 0, Inertial.heading(degrees));
+    g_state.odom.reset(0, 0, Inertial.heading(rotationUnits::deg));
 }
 
 // Normalize angle to -180..180
@@ -72,12 +74,13 @@ void stopDrive()
 void turnToHeading(double targetDeg, double tolerance = 2.0, double timeout_ms = 5000)
 {
     PID turnPID(TURN_KP, TURN_KI, TURN_KD);
-    double start = Brain.timer(msec);
+    vex::timer turnTimer;
+    turnTimer.resetTimer();
     double current;
 
     while (true)
     {
-        current = Inertial.heading(degrees);
+        current = Inertial.heading(rotationUnits::deg);
         double error = normalizeAngle(targetDeg - current);
         double output = turnPID.compute(error, DT);
 
@@ -85,7 +88,7 @@ void turnToHeading(double targetDeg, double tolerance = 2.0, double timeout_ms =
 
         if (fabs(error) < tolerance)
             break;
-        if (Brain.timer(msec) - start > timeout_ms)
+        if (turnTimer.time(timeUnits::msec) > timeout_ms)
             break;
         wait(20, msec);
     }
@@ -102,7 +105,6 @@ void auto_Isolation()
 
     // State machine: SEARCH → COLLECT → SCORE
     g_state.state = RobotState::SEARCH;
-    AI_RECORD detection;
 
     int collectCount = 0;
     const int COLLECT_TARGET = 3;
@@ -110,8 +112,8 @@ void auto_Isolation()
     while (true)
     {
         // Update odometry
-        double trackingDeg = TrackingWheel.position(degrees);
-        double headingDeg = Inertial.heading(degrees);
+        double trackingDeg = TrackingWheel.position(rotationUnits::deg);
+        double headingDeg = Inertial.heading(rotationUnits::deg);
         g_state.odom.update(trackingDeg, headingDeg);
 
         switch (g_state.state)
@@ -157,10 +159,12 @@ void auto_Isolation()
             Intake.spin(fwd, 70, pct);
             setDriveVel(10, 10);
 
-            // Check for ball detection
-            if (g_state.jetson.update() > 0)
+            // Check for ball detection via Jetson AI vision
+            AI_RECORD record;
+            if (jetson_comms.get_data(&record) > 0 && record.detectionCount > 0)
             {
-                g_state.jetson.getDetection(0, detection);
+                // Got detection — count it
+                (void)record; // suppress unused warning
                 collectCount++;
             }
 
@@ -242,10 +246,9 @@ void auto_Isolation()
         }
 
         // Debug — print to Brain screen
-        BrainScreen.clearLine(1, color::black);
+        BrainScreen.clearScreen();
         BrainScreen.print("State: %s", g_state.stateName());
-        BrainScreen.newLine();
-        BrainScreen.print("X: %.1f  Y: %.1f  H: %.1f",
+        BrainScreen.printAt(0, 30, true, "X: %.1f  Y: %.1f  H: %.1f",
                           g_state.odom.x(), g_state.odom.y(), g_state.odom.theta());
 
         wait(20, msec);
@@ -297,11 +300,8 @@ void usercontrol()
 
 int main()
 {
-    // Initialize Jetson comms
-    if (!g_state.jetson.init())
-    {
-        BrainScreen.print("Jetson serial not connected!");
-    }
+    // Request initial frame from Jetson AI vision
+    jetson_comms.request_map();
 
     // Register competition callbacks
     Competition.autonomous(auto_Isolation);
