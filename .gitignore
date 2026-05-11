@@ -1,0 +1,2 @@
+# Ignore VS Code C++ properties file which contains user-specific include paths
+.vscode/c_cpp_properties.json
