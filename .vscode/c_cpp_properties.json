@@ -1,0 +1,19 @@
+{
+	"configurations": [
+		{
+			"name": "VEX V5",
+			"includePath": [
+				"${workspaceFolder}/include/**",
+				"${workspaceFolder}/src/**",
+				"/Users/anthonychen/Library/Application Support/Code/User/globalStorage/vexrobotics.vexcode/sdk/cpp/V5/V5_20240802_15_00_00/vexv5/include/**",
+				"/Users/anthonychen/Library/Application Support/Code/User/globalStorage/vexrobotics.vexcode/sdk/cpp/V5/V5_20240802_15_00_00/vexv5/clang/8.0.0/include/**",
+				"/Users/anthonychen/Library/Application Support/Code/User/globalStorage/vexrobotics.vexcode/sdk/cpp/V5/V5_20240802_15_00_00/vexv5/gcc/include/**"
+			],
+			"compilerPath": "/usr/bin/clang",
+			"cStandard": "gnu99",
+			"cppStandard": "gnu++11",
+			"intelliSenseMode": "macos-clang-x86"
+		}
+	],
+	"version": 4
+}
