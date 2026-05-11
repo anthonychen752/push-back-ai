@@ -39,12 +39,12 @@ const double DT = 0.02; // 20ms = 50 Hz
 void calibrate()
 {
     Inertial.calibrate();
-    TrackingWheel.resetPosition(0);
+    TrackingWheel.resetPosition();
     while (Inertial.isCalibrating())
     {
         wait(20, msec);
     }
-    g_state.odom.reset(0, 0, Inertial.heading(rotationUnits::deg));
+    g_state.odom.reset(0, 0, Inertial.heading(degrees));
 }
 
 // Normalize angle to -180..180
@@ -75,7 +75,7 @@ void turnToHeading(double targetDeg, double tolerance = 2.0, double timeout_ms =
 {
     PID turnPID(TURN_KP, TURN_KI, TURN_KD);
     vex::timer turnTimer;
-    turnTimer.resetTimer();
+    turnTimer.reset();
     double current;
 
     while (true)
@@ -105,6 +105,7 @@ void auto_Isolation()
 
     // State machine: SEARCH → COLLECT → SCORE
     g_state.state = RobotState::SEARCH;
+    AI_RECORD detection;
 
     int collectCount = 0;
     const int COLLECT_TARGET = 3;
@@ -112,8 +113,8 @@ void auto_Isolation()
     while (true)
     {
         // Update odometry
-        double trackingDeg = TrackingWheel.position(rotationUnits::deg);
-        double headingDeg = Inertial.heading(rotationUnits::deg);
+        double trackingDeg = TrackingWheel.position(degrees);
+        double headingDeg = Inertial.heading(degrees);
         g_state.odom.update(trackingDeg, headingDeg);
 
         switch (g_state.state)
@@ -159,12 +160,10 @@ void auto_Isolation()
             Intake.spin(fwd, 70, pct);
             setDriveVel(10, 10);
 
-            // Check for ball detection via Jetson AI vision
-            AI_RECORD record;
-            if (jetson_comms.get_data(&record) > 0 && record.detectionCount > 0)
+            // Check for ball detection
+            if (g_state.jetson.update() > 0)
             {
-                // Got detection — count it
-                (void)record; // suppress unused warning
+                g_state.jetson.getDetection(0, detection);
                 collectCount++;
             }
 
@@ -246,10 +245,20 @@ void auto_Isolation()
         }
 
         // Debug — print to Brain screen
-        BrainScreen.clearScreen();
+        BrainScreen.clearLine(1, color::black);
         BrainScreen.print("State: %s", g_state.stateName());
-        BrainScreen.printAt(0, 30, true, "X: %.1f  Y: %.1f  H: %.1f",
+        BrainScreen.newLine();
+        BrainScreen.print("X: %.1f  Y: %.1f  H: %.1f",
                           g_state.odom.x(), g_state.odom.y(), g_state.odom.theta());
+        BrainScreen.newLine();
+        BrainScreen.print("Cam: %d objs", detection.detectionCount);
+        if (detection.detectionCount > 0)
+        {
+            BrainScreen.newLine();
+            BrainScreen.print("O0: %.1fm, %.1fm",
+                              detection.detections[0].mapLocation.x,
+                              detection.detections[0].mapLocation.y);
+        }
 
         wait(20, msec);
     }
@@ -300,8 +309,11 @@ void usercontrol()
 
 int main()
 {
-    // Request initial frame from Jetson AI vision
-    jetson_comms.request_map();
+    // Initialize Jetson comms
+    if (!g_state.jetson.init())
+    {
+        BrainScreen.print("Jetson serial not connected!");
+    }
 
     // Register competition callbacks
     Competition.autonomous(auto_Isolation);
