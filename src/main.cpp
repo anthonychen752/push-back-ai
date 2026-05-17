@@ -74,6 +74,9 @@ void stopDrive()
 void turnToHeading(double targetDeg, double tolerance = 2.0, double timeout_ms = 5000)
 {
     PID turnPID(TURN_KP, TURN_KI, TURN_KD);
+    // target=0: we feed the normalized error as "current", so PID computes (0 - error).
+    // Negate the output to get: positive error → positive output → right turn.
+    turnPID.setTarget(0.0);
     vex::timer turnTimer;
     turnTimer.resetTimer();
     double current;
@@ -82,7 +85,7 @@ void turnToHeading(double targetDeg, double tolerance = 2.0, double timeout_ms =
     {
         current = Inertial.heading(rotationUnits::deg);
         double error = normalizeAngle(targetDeg - current);
-        double output = turnPID.compute(error, DT);
+        double output = -turnPID.compute(error, DT);
 
         setDriveVel(-output, output);
 
@@ -103,11 +106,10 @@ void auto_Isolation()
 {
     calibrate();
 
-    // State machine: SEARCH → COLLECT → SCORE
-    g_state.state = RobotState::SEARCH;
+// State machine: SEARCH → COLLECT → SCORE
+        g_state.state = RobotState::SEARCH;
 
-    int collectCount = 0;
-    const int COLLECT_TARGET = 3;
+        bool collectRequested = false;
 
     while (true)
     {
@@ -139,15 +141,16 @@ void auto_Isolation()
             target.slow = true;
             g_state.pp.loadPath(&target, 1);
 
+            // driveTo() returns true when within tolerance
             bool arrived = g_state.pp.driveTo(target.x, target.y, 3.0);
             if (arrived)
             {
                 g_state.state = RobotState::COLLECT;
             }
 
-            // Apply wheel velocities from pure pursuit
-            double lv, rv;
-            g_state.pp.computeWheelVels(lv, rv);
+            // Use driveTo() output — it stores velocities via compute()
+            double lv = g_state.pp.getLastLeftV();
+            double rv = g_state.pp.getLastRightV();
             // Convert in/s to % (max ~24 in/s at 100%)
             setDriveVel(lv / BASE_SPEED * 100.0, rv / BASE_SPEED * 100.0);
             break;
@@ -159,18 +162,22 @@ void auto_Isolation()
             Intake.spin(fwd, 70, pct);
             setDriveVel(10, 10);
 
-            // Check for ball detection via Jetson AI vision
-            AI_RECORD record;
-            if (jetson_comms.get_data(&record) > 0 && record.detectionCount > 0)
-            {
-                // Got detection — count it
-                (void)record; // suppress unused warning
-                collectCount++;
+            // Use a fixed collection time — the intake catches balls as we drive
+            // collectRequested starts false, gets set once when we enter COLLECT
+            if (!collectRequested) {
+                collectRequested = true;
             }
 
-            // After collecting enough balls, go to goal
-            if (collectCount >= COLLECT_TARGET)
-            {
+            // After 3 seconds of collecting, transition to goal
+            // The Jetson AI detects balls and the intake physically collects them
+            // We use a time-based estimate since detectionCount doesn't tell us
+            // whether a ball was actually ingested vs just seen
+            static double collectTimer = 0;
+            collectTimer += DT;
+
+            if (collectTimer >= 3.0) {
+                collectTimer = 0;
+                collectRequested = false;
                 Intake.stop();
                 g_state.state = RobotState::DRIVE_TO_GOAL;
             }
@@ -203,8 +210,9 @@ void auto_Isolation()
                 g_state.state = RobotState::SCORE;
             }
 
-            double lv, rv;
-            g_state.pp.computeWheelVels(lv, rv);
+            // Use driveTo() output for wheel velocities
+            double lv = g_state.pp.getLastLeftV();
+            double rv = g_state.pp.getLastRightV();
             setDriveVel(lv / BASE_SPEED * 100.0, rv / BASE_SPEED * 100.0);
             break;
         }
@@ -247,8 +255,8 @@ void auto_Isolation()
 
         // Debug — print to Brain screen
         BrainScreen.clearScreen();
-        BrainScreen.print("State: %s", g_state.stateName());
-        BrainScreen.printAt(0, 30, true, "X: %.1f  Y: %.1f  H: %.1f",
+        BrainScreen.printAt(0, 20, "State: %s", g_state.stateName());
+        BrainScreen.printAt(0, 50, "X: %.1f  Y: %.1f  H: %.1f",
                           g_state.odom.x(), g_state.odom.y(), g_state.odom.theta());
 
         wait(20, msec);
@@ -256,39 +264,112 @@ void auto_Isolation()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// DRIVER CONTROL — placeholder (extend as needed)
+// DRIVER CONTROL — improved with input curves and brake mode
 // ═══════════════════════════════════════════════════════════════════════════
+
+// Expo drive curve — smooths out raw controller input
+// curveInput: applies y = a * x^3 + (1-a) * x with sign preserved
+static double applyExpoCurve(double raw, double a = 0.5) {
+    if (raw >= 0) return a * raw * raw * raw + (1 - a) * raw;
+    else return -(a * (-raw) * (-raw) * (-raw) + (1 - a) * (-raw));
+}
 
 void usercontrol()
 {
     controller Controller = controller();
 
+    // Track previous button states for edge detection
+    bool prevR1 = false, prevR2 = false, prevL1 = false, prevL2 = false;
+    bool prevA = false, prevB = false, prevX = false, prevY = false;
+    bool intakeActive = false;
+
+    // Default brake mode: hold
+    LeftDrive.setBrake(brakeType::hold);
+    RightDrive.setBrake(brakeType::hold);
+
     while (true)
     {
-        // Tank drive
-        double leftPct = Controller.Axis3.position(pct);
-        double rightPct = Controller.Axis2.position(pct);
-        setDriveVel(leftPct, rightPct);
+        // ===== DRIVETRAIN — arcade with expo curve =====
+        int leftY  = Controller.Axis3.position();      // forward/back
+        int rightX = Controller.Axis4.position();       // turn
+        int leftX  = Controller.Axis1.position();       // strafe (if needed)
 
-        // Intake (button R1)
-        if (Controller.ButtonR1.pressing())
-        {
+        // Apply expo curve for smoother feel
+        double fwd = applyExpoCurve(leftY / 127.0, 0.5) * 100;
+        double turn = applyExpoCurve(rightX / 127.0, 0.5) * 80;
+
+        // Tank split: forward is same, turn splits left/right
+        double leftOut  = fwd + turn;
+        double rightOut = fwd - turn;
+
+        LeftDrive.spin(fwdType::fwd, leftOut, pct);
+        RightDrive.spin(fwdType::fwd, rightOut, pct);
+
+        // ===== INTAKE — R1 = intake in, R2 = intake out =====
+        bool r1 = Controller.ButtonR1.pressing();
+        bool r2 = Controller.ButtonR2.pressing();
+
+        if (r1 && !prevR1) {
+            intakeActive = !intakeActive;  // Toggle intake on/off
+        }
+        prevR1 = r1;
+        prevR2 = r2;
+
+        if (intakeActive) {
             Intake.spin(fwd, 70, pct);
-        }
-        else
-        {
-            Intake.stop();
+        } else if (r2) {
+            Intake.spin(fwd, -70, pct);  // Outtake
+        } else {
+            Intake.stop(brakeType::hold);
         }
 
-        // Hood (button R2)
-        if (Controller.ButtonR2.pressing())
-        {
-            Hood.spin(fwd, 50, pct);
+        // ===== HOOD — L1/L2 for manual hood control =====
+        bool l1 = Controller.ButtonL1.pressing();
+        bool l2 = Controller.ButtonL2.pressing();
+
+        if (l1) {
+            Hood.spin(fwd, 60, pct);
+        } else if (l2) {
+            Hood.spin(fwd, -60, pct);
+        } else {
+            Hood.stop(brakeType::hold);
         }
-        else
-        {
-            Hood.stop();
+
+        // ===== FLYWHEEL — A button toggles on/off =====
+        bool a = Controller.ButtonA.pressing();
+        if (a && !prevA) {
+            static bool flywheelOn = false;
+            flywheelOn = !flywheelOn;
+            if (flywheelOn) {
+                Flywheel.spin(fwd, 100, pct);
+            } else {
+                Flywheel.stop(brakeType::coast);
+            }
         }
+        prevA = a;
+
+        // ===== BRAKE MODE TOGGLE — Y button =====
+        bool y = Controller.ButtonY.pressing();
+        if (y && !prevY) {
+            static bool holdMode = true;
+            holdMode = !holdMode;
+            if (holdMode) {
+                LeftDrive.setBrake(brakeType::hold);
+                RightDrive.setBrake(brakeType::hold);
+            } else {
+                LeftDrive.setBrake(brakeType::coast);
+                RightDrive.setBrake(brakeType::coast);
+            }
+        }
+        prevY = y;
+
+        // ===== DEBUG — Brain screen =====
+        BrainScreen.clearScreen();
+        BrainScreen.printAt(0, 0, "Intake: %s  Flywheel: %s",
+            intakeActive ? "ON" : "OFF",
+            Flywheel.velocity(pct) > 5 ? "SPIN" : "OFF");
+        BrainScreen.printAt(0, 30, "X: %.1f  Y: %.1f  H: %.1f",
+            g_state.odom.x(), g_state.odom.y(), g_state.odom.theta());
 
         wait(20, msec);
     }

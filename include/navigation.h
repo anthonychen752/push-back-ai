@@ -1,19 +1,81 @@
-/*----------------------------------------------------------------------------*/
-/*                                                                            */
-/*   VEX AI Push Back - Navigation Module                                    */
-/*   Odometry + PID + Pure Pursuit                                           */
-/*   For: 8WD Tank (6 motors, 3/side), 2" tracking omni, inertial heading  */
-/*                                                                            */
-/*----------------------------------------------------------------------------*/
+
 
 #ifndef NAVIGATION_H
 #define NAVIGATION_H
 
+#if __has_include(<cmath>)
 #include <cmath>
+#elif __has_include(<math.h>)
+#include <math.h>
+#else
+#error "Missing math header"
+#endif
+
+#if __has_include(<cstdint>)
 #include <cstdint>
-#include <vector>
-#include <algorithm>
-#include "ai_jetson.h"
+#elif __has_include(<stdint.h>)
+#include <stdint.h>
+#else
+#error "Missing stdint header"
+#endif
+
+#if defined(__has_include)
+#if __has_include("vex_aivision.h")
+#include "vex_aivision.h"
+#elif __has_include(<vex_aivision.h>)
+#include <vex_aivision.h>
+#elif __has_include("vex.h")
+#include "vex.h"
+#elif __has_include(<vex.h>)
+#include <vex.h>
+#else
+// Minimal VEX stubs for environments without VEX headers available.
+namespace vex
+{
+    enum directionType
+    {
+        fwd,
+        rev
+    };
+}
+namespace ai
+{
+    class jetson
+    {
+    public:
+        int get_data(void *) { return 0; }
+    };
+}
+using PortName = int;
+constexpr PortName PORT1 = 1;
+constexpr PortName PORT2 = 2;
+constexpr PortName PORT3 = 3;
+constexpr PortName PORT4 = 4;
+constexpr PortName PORT5 = 5;
+constexpr PortName PORT6 = 6;
+constexpr PortName PORT7 = 7;
+constexpr PortName PORT8 = 8;
+constexpr PortName PORT9 = 9;
+constexpr PortName PORT10 = 10;
+constexpr PortName PORT11 = 11;
+constexpr PortName PORT12 = 12;
+constexpr PortName PORT13 = 13;
+constexpr PortName PORT14 = 14;
+constexpr PortName PORT15 = 15;
+constexpr PortName PORT16 = 16;
+constexpr PortName PORT17 = 17;
+constexpr PortName PORT18 = 18;
+constexpr PortName PORT19 = 19;
+constexpr PortName PORT20 = 20;
+
+struct AI_RECORD
+{
+    int detectionCount = 0;
+};
+#endif
+#else
+#include "vex.h"
+#endif
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONFIG — update these for your robot
@@ -272,6 +334,14 @@ public:
         return _pathLen - 1; // default to last waypoint
     }
 
+    // Normalize angle to -π..π
+    static double normalizeAngleRad(double a)
+    {
+        while (a > M_PI) a -= TWO_PI;
+        while (a < -M_PI) a += TWO_PI;
+        return a;
+    }
+
     // Compute curvature to a target point
     // curvature = 1/radius (positive = turn left)
     double computeCurvature(double targetX, double targetY)
@@ -288,12 +358,15 @@ public:
         if (L < 0.001)
             return 0;
 
-        // Angle to target in robot frame
+        // Angle to target in robot frame (radians)
         double alpha = atan2(dy, dx) - robotTheta;
-        alpha = normalizeAngle(alpha * DEG_PER_RAD) * RAD_PER_DEG;
+        // Normalize to -π..π (avoids double-conversion bug)
+        alpha = normalizeAngleRad(alpha);
 
-        // Simple signed curvature based on target direction
+        // Signed curvature: kappa = 2*sin(α)/L
         double kappa = 2.0 * sin(alpha) / L;
+
+        // Determine turn direction from relative angle to target
         double angleToTarget = angleTo(targetX, targetY);
         double relAngle = normalizeAngle(angleToTarget - _odom.theta());
         return (relAngle > 0) ? fabs(kappa) : -fabs(kappa);
@@ -470,12 +543,16 @@ public:
 
     StateMachine() : odom(), pp(odom)
     {
-        COLLECT_ZONES[0] = Waypoint(30, 30);
-        COLLECT_ZONES[1] = Waypoint(60, 0);
-        COLLECT_ZONES[2] = Waypoint(30, -30);
-        SCORE_LEFT = Waypoint(-50, 60, true);
-        SCORE_RIGHT = Waypoint(-50, -60, true);
-        PARK_POS = Waypoint(0, 0);
+        // Field is 369x369 cm. Origin at center (0,0).
+        // X-East (+X = east), Y-North (+Y = north), 0° = North
+        // Ball zones: areas where balls are distributed around the field perimeter
+        // Starting zone for worker (3177B): near center-ish
+        COLLECT_ZONES[0] = Waypoint(0, 80);      // north center-ish
+        COLLECT_ZONES[1] = Waypoint(70, 40);     // northeast
+        COLLECT_ZONES[2] = Waypoint(-70, 40);    // northwest
+        SCORE_LEFT  = Waypoint(-70, 120, true);   // corner goal NW (slow approach)
+        SCORE_RIGHT = Waypoint( 70, 120, true);   // corner goal NE (slow approach)
+        PARK_POS    = Waypoint(0, 0);            // return to center
     }
 
     void reset()

@@ -16,7 +16,7 @@ competition Competition;
 controller Controller1;
 
 // VEX AI Jetson Nano communication (uses VEX's ai::jetson class)
-// ai::jetson jetson_comms;
+ai::jetson jetson_comms;
 
 // Drive motors (ratio6_1 = 450 RPM, confirmed for 3177B)
 motor LeftDrive1(PORT1, ratio6_1, false);

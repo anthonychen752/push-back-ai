@@ -33,6 +33,7 @@ extern rotation TrackingWheel;
 extern inertial Inertial;
 
 extern motor Intake;
+extern motor Flywheel;
 extern motor Hood;
 
 #endif

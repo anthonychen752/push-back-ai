@@ -310,10 +310,12 @@ jetson::request_map() {
       static char msg[] = "AA55CC3301\r\n"; 
 
       // send
-      fwrite( msg, 1, strlen(msg), fp );
+      if( fp != NULL ) {
+        fwrite( msg, 1, strlen(msg), fp );
 
-      // close, flush buffers
-      fclose(fp);
+        // close, flush buffers
+        fclose(fp);
+      }
     }
 }
 
