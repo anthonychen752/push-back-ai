@@ -13,9 +13,6 @@
 
 using namespace vex;
 
-// VEX AI Jetson communication (uses VEX's built-in ai::jetson class)
-extern ai::jetson jetson_comms;
-
 extern brain Brain;
 extern competition Competition;
 extern controller Controller1;
@@ -33,6 +30,9 @@ extern rotation TrackingWheel;
 extern inertial Inertial;
 
 extern motor Intake;
+extern motor Flywheel;
 extern motor Hood;
+
+void vexcodeInit(void);
 
 #endif

@@ -11,8 +11,7 @@
 
 #include <cmath>
 #include <cstdint>
-#include <vector>
-#include <algorithm>
+#include <cstring>
 #include "ai_jetson.h"
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -40,7 +39,7 @@
 
 // Pure pursuit
 #define LOOKAHEAD_DISTANCE 12.0 // inches ahead to look
-#define BASE_SPEED 24.0         // inches/sec max
+#define BASE_SPEED 24.0         // scaling factor; treated as the in/s value that maps to 100% motor
 
 // PID gains — TUNE THESE for your robot
 #define TURN_KP 1.2
@@ -62,6 +61,9 @@
 #define DEG_PER_RAD 57.2957795131
 // Radians per degree
 #define RAD_PER_DEG 0.0174532925199
+
+// Jetson reports field coordinates in meters; odometry is in inches.
+#define METERS_TO_INCHES 39.3700787
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ODOMETRY
@@ -276,27 +278,21 @@ public:
     // curvature = 1/radius (positive = turn left)
     double computeCurvature(double targetX, double targetY)
     {
-        double robotX = _odom.x();
-        double robotY = _odom.y();
-        double robotTheta = _odom.theta() * RAD_PER_DEG;
+        double dx = targetX - _odom.x();
+        double dy = targetY - _odom.y();
 
-        double dx = targetX - robotX;
-        double dy = targetY - robotY;
-
-        // Distance to target
         double L = sqrt(dx * dx + dy * dy);
         if (L < 0.001)
             return 0;
 
-        // Angle to target in robot frame
-        double alpha = atan2(dy, dx) - robotTheta;
-        alpha = normalizeAngle(alpha * DEG_PER_RAD) * RAD_PER_DEG;
+        // Angle to target in robot frame, normalized to (-PI, PI] in radians directly.
+        double alpha = atan2(dy, dx) - _odom.theta() * RAD_PER_DEG;
+        while (alpha > PI)
+            alpha -= TWO_PI;
+        while (alpha < -PI)
+            alpha += TWO_PI;
 
-        // Simple signed curvature based on target direction
-        double kappa = 2.0 * sin(alpha) / L;
-        double angleToTarget = angleTo(targetX, targetY);
-        double relAngle = normalizeAngle(angleToTarget - _odom.theta());
-        return (relAngle > 0) ? fabs(kappa) : -fabs(kappa);
+        return 2.0 * sin(alpha) / L;
     }
 
     // Compute wheel velocities to follow path
@@ -340,47 +336,12 @@ public:
         }
     }
 
-    // Direct driveTo — single target with PID
-    // Returns true when within tolerance
+    // Have we arrived within tolerance of the target?
+    // Steering is owned by computeWheelVels; this is just an arrival check.
     bool driveTo(double targetX, double targetY, double tolerance = 2.0)
     {
-        double dist = distTo(targetX, targetY);
-        if (dist < tolerance)
-            return true;
-
-        double angle = angleTo(targetX, targetY);
-        double relAngle = normalizeAngle(angle - _odom.theta());
-
-        // Heading correction
-        _headingPID.setTarget(_odom.theta() + relAngle);
-        double turnCmd = _headingPID.compute(_odom.theta());
-
-        // Speed based on distance
-        double speedCmd = DRIVE_KP * dist;
-        if (speedCmd > _baseSpeed)
-            speedCmd = _baseSpeed;
-        if (speedCmd < 3.0)
-            speedCmd = 3.0;
-
-        double leftV = speedCmd - turnCmd;
-        double rightV = speedCmd + turnCmd;
-
-        // Apply to motors (caller does this)
-        // leftDrive.spin(fwd, leftV, rpm);
-        // rightDrive.spin(fwd, rightV, rpm);
-
-        // Store for retrieval
-        _lastLeftV = leftV;
-        _lastRightV = rightV;
-
-        return false;
+        return distTo(targetX, targetY) < tolerance;
     }
-
-    double getLastLeftV() const { return _lastLeftV; }
-    double getLastRightV() const { return _lastRightV; }
-
-private:
-    double _lastLeftV = 0, _lastRightV = 0;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -393,19 +354,29 @@ private:
 class JetsonComms
 {
 public:
-    JetsonComms() : _detectionCount(0), _connected(false) {}
+    JetsonComms() : _detectionCount(0), _connected(false), _lastReqMs(0) {}
 
     bool init()
     {
+        memset(&_latest, 0, sizeof(_latest));
         _connected = true;
         return true;
     }
 
+    // Returns the number of detections in the latest record.
+    // Polls request_map() at ~20 Hz so the Jetson stays fed.
     int update()
     {
         if (!_connected)
         {
             return 0;
+        }
+
+        uint32_t now = vex::timer::system();
+        if (now - _lastReqMs > 50)
+        {
+            _jetson.request_map();
+            _lastReqMs = now;
         }
 
         int32_t result = _jetson.get_data(&_latest);
@@ -419,15 +390,27 @@ public:
         return _detectionCount;
     }
 
-    bool getDetection(int index, AI_RECORD &out)
+    // Copy the full latest record (pose + all detections) into out.
+    bool getRecord(AI_RECORD &out)
     {
-        if (index < 0 || index >= _latest.detectionCount)
-        {
+        if (!_connected)
             return false;
-        }
         out = _latest;
         return true;
     }
+
+    // Copy a single detection by index into out.
+    bool getDetection(int index, DETECTION_OBJECT &out)
+    {
+        if (index < 0 || index >= _latest.detectionCount)
+            return false;
+        out = _latest.detections[index];
+        return true;
+    }
+
+    // Frame counter from the most recent record. Useful for de-duping detections
+    // across loop ticks: only count a detection as "new" when frameCnt changes.
+    int32_t frameCnt() const { return _latest.pos.framecnt; }
 
     int detectionCount() const { return _detectionCount; }
     bool isConnected() const { return _connected; }
@@ -438,6 +421,7 @@ private:
     AI_RECORD _latest;
     int _detectionCount;
     bool _connected;
+    uint32_t _lastReqMs;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════

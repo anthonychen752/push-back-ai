@@ -9,6 +9,7 @@
 #include "robot-config.h"
 #include "navigation.h"
 #include <cmath>
+#include <cstring>
 
 namespace bex = vex;
 using namespace bex;
@@ -57,9 +58,18 @@ double normalizeAngle(double a)
     return a;
 }
 
-// Drive tank with left/right velocity (0..100 %)
+// Drive tank with left/right velocity (-100..100 %).
+// Clamps proportionally so the steering ratio is preserved if either side
+// would saturate.
 void setDriveVel(double leftPct, double rightPct)
 {
+    double maxMag = fmax(fabs(leftPct), fabs(rightPct));
+    if (maxMag > 100.0)
+    {
+        double scale = 100.0 / maxMag;
+        leftPct *= scale;
+        rightPct *= scale;
+    }
     LeftDrive.spin(fwd, leftPct, pct);
     RightDrive.spin(fwd, rightPct, pct);
 }
@@ -105,17 +115,23 @@ void auto_Isolation()
 
     // State machine: SEARCH → COLLECT → SCORE
     g_state.state = RobotState::SEARCH;
-    AI_RECORD detection;
+    AI_RECORD record;
+    memset(&record, 0, sizeof(record));
 
     int collectCount = 0;
+    int32_t lastCountedFrame = 0;
     const int COLLECT_TARGET = 3;
+    const int COLLECT_TIMEOUT_MS = 4000; // give up if no balls show up
+    vex::timer collectTimer;
 
     while (true)
     {
-        // Update odometry
+        // Update odometry and pull a fresh Jetson record (rate-limited internally)
         double trackingDeg = TrackingWheel.position(degrees);
         double headingDeg = Inertial.heading(degrees);
         g_state.odom.update(trackingDeg, headingDeg);
+        g_state.jetson.update();
+        g_state.jetson.getRecord(record);
 
         switch (g_state.state)
         {
@@ -144,6 +160,8 @@ void auto_Isolation()
             if (arrived)
             {
                 g_state.state = RobotState::COLLECT;
+                collectTimer.reset();
+                lastCountedFrame = g_state.jetson.frameCnt();
             }
 
             // Apply wheel velocities from pure pursuit
@@ -160,15 +178,17 @@ void auto_Isolation()
             Intake.spin(fwd, 70, pct);
             setDriveVel(10, 10);
 
-            // Check for ball detection
-            if (g_state.jetson.update() > 0)
+            // Count a ball only when the Jetson sends a NEW frame with detections.
+            // Without this gate, a single detection at 50 Hz would over-count.
+            int32_t frame = g_state.jetson.frameCnt();
+            if (record.detectionCount > 0 && frame != lastCountedFrame)
             {
-                g_state.jetson.getDetection(0, detection);
+                lastCountedFrame = frame;
                 collectCount++;
             }
 
-            // After collecting enough balls, go to goal
-            if (collectCount >= COLLECT_TARGET)
+            // Move on once we've collected enough balls or run out of time.
+            if (collectCount >= COLLECT_TARGET || collectTimer.time(timeUnits::msec) > COLLECT_TIMEOUT_MS)
             {
                 Intake.stop();
                 g_state.state = RobotState::DRIVE_TO_GOAL;
@@ -251,13 +271,13 @@ void auto_Isolation()
         BrainScreen.print("X: %.1f  Y: %.1f  H: %.1f",
                           g_state.odom.x(), g_state.odom.y(), g_state.odom.theta());
         BrainScreen.newLine();
-        BrainScreen.print("Cam: %d objs", detection.detectionCount);
-        if (detection.detectionCount > 0)
+        BrainScreen.print("Cam: %d objs", record.detectionCount);
+        if (record.detectionCount > 0)
         {
             BrainScreen.newLine();
             BrainScreen.print("O0: %.1fm, %.1fm",
-                              detection.detections[0].mapLocation.x,
-                              detection.detections[0].mapLocation.y);
+                              record.detections[0].mapLocation.x,
+                              record.detections[0].mapLocation.y);
         }
 
         wait(20, msec);
@@ -309,6 +329,9 @@ void usercontrol()
 
 int main()
 {
+    // Initialize hardware (defined in robot-config.cpp)
+    vexcodeInit();
+
     // Initialize Jetson comms
     if (!g_state.jetson.init())
     {
@@ -319,9 +342,9 @@ int main()
     Competition.autonomous(auto_Isolation);
     Competition.drivercontrol(usercontrol);
 
-    // Default: run driver control until competition starts
-    while (!Competition.isEnabled())
+    // Keep main alive; the VEX runtime invokes the registered callbacks.
+    while (true)
     {
-        wait(20, msec);
+        wait(100, msec);
     }
 }
